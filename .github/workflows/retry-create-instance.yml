@@ -97,6 +97,7 @@ jobs:
             2>&1)
 
           EXIT_CODE=$?
+          echo "$RESULT"
           echo "$RESULT" > /tmp/result.txt
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
