@@ -103,11 +103,23 @@ jobs:
 
           if echo "$RESULT" | grep -qi '"lifecycle-state": "RUNNING"'; then
             echo "success=true" >> "$GITHUB_OUTPUT"
+            echo "unexpected_error=false" >> "$GITHUB_OUTPUT"
             PUBLIC_IP=$(echo "$RESULT" | grep -o '"public-ip": "[^"]*"' | head -1 | cut -d'"' -f4)
             echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
             echo "shape_used=$SHAPE" >> "$GITHUB_OUTPUT"
           else
             echo "success=false" >> "$GITHUB_OUTPUT"
+            # Routine, expected misses: no capacity, or tenant rate-limited. Anything
+            # else (bad credentials, config, quota type errors, etc.) is unexpected
+            # and worth flagging — those won't just resolve themselves by waiting.
+            if echo "$RESULT" | grep -qi "out of host capacity\|out of capacity\|TooManyRequests"; then
+              echo "unexpected_error=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "unexpected_error=true" >> "$GITHUB_OUTPUT"
+              # Telegram message text has length/char limits, keep it short.
+              SHORT_ERROR=$(echo "$RESULT" | tr '\n' ' ' | cut -c1-500)
+              echo "error_text=$SHORT_ERROR" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Save success marker and push
@@ -130,4 +142,14 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" \
             -d text="✅ Oracle VPN server created! Shape: ${{ steps.launch.outputs.shape_used }}, IP: ${{ steps.launch.outputs.public_ip }}"
+
+      - name: Notify via Telegram on unexpected error
+        if: steps.check.outputs.already_created == 'false' && steps.launch.outputs.unexpected_error == 'true'
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="⚠️ Retry workflow hit an unexpected error (not just capacity/rate-limit): ${{ steps.launch.outputs.error_text }}"
 
