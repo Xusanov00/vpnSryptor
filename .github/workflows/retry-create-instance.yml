@@ -1,0 +1,131 @@
+name: OCI Free Tier Instance Retry
+
+on:
+  schedule:
+    # Runs every 5 minutes, 24/7, entirely on GitHub's servers.
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab too
+
+concurrency:
+  group: oci-instance-retry
+  cancel-in-progress: false
+
+jobs:
+  try-create:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip if instance already created
+        id: check
+        run: |
+          # If a previous successful run left a marker in the repo, stop trying.
+          if [ -f ".oci/SUCCESS.json" ]; then
+            echo "already_created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_created=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repo
+        if: steps.check.outputs.already_created == 'false'
+        uses: actions/checkout@v4
+
+      - name: Install OCI CLI
+        if: steps.check.outputs.already_created == 'false'
+        run: pip install --quiet oci-cli
+
+      - name: Write OCI config and key
+        if: steps.check.outputs.already_created == 'false'
+        env:
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s' "$OCI_PRIVATE_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<CONF
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=~/.oci/key.pem
+          CONF
+
+      - name: Try to launch instance (alternates ARM / AMD shape each run)
+        if: steps.check.outputs.already_created == 'false'
+        id: launch
+        env:
+          SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          IMAGE_ARM: ${{ secrets.OCI_IMAGE_ARM }}
+          IMAGE_AMD: ${{ secrets.OCI_IMAGE_AMD }}
+          COMPARTMENT_ID: ${{ secrets.OCI_TENANCY_OCID }}
+          AD: "JMuG:AP-SINGAPORE-1-AD-1"
+          SSH_PUBLIC_KEY: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDTgEDbw4w13MQ9KdtfshDRWfxRiESwf4hFNDrcXOVeAEdPgBTrYUB5Ps/92FGA/vgtnDFPV1j6GBzGDBZXbRmB3HMQ6IwWGrtnFUdfSyhLUmNVijD9PoLA1lwiUsASy8LEYx/ooGIc3ZvsLaqMVENip4z0T6M1k3oqEA1MbSsncIvMTX6BxU26ZWwbxFoeI8N1J95lA8eUfD4o5wU08QaZOABPAdXKS881ybvtOvG9sfHVtEzYLH14vadFQXGF1ARBcGbBZ1hdvBbuFxMrgWB8fOtnPkbLYsXXxM3np8AuVAre6soi8cSfHGtGdbE9tsxB4Eo1O8EhBQOZy1Nse3jV ssh-key-2026-11-27"
+        run: |
+          set +e
+          # Alternate shape based on current minute (even/odd 5-min slot) so we
+          # try both free shapes over time without needing persistent state.
+          MIN=$(date +%M)
+          SLOT=$(( (10#$MIN / 5) % 2 ))
+
+          if [ "$SLOT" = "0" ]; then
+            SHAPE="VM.Standard.A1.Flex"
+            IMAGE="$IMAGE_ARM"
+            SHAPE_CONFIG_ARGS="--shape-config '{\"ocpus\":1,\"memoryInGBs\":6}'"
+          else
+            SHAPE="VM.Standard.E2.1.Micro"
+            IMAGE="$IMAGE_AMD"
+            SHAPE_CONFIG_ARGS=""
+          fi
+
+          echo "Trying shape: $SHAPE"
+
+          RESULT=$(eval oci compute instance launch \
+            --compartment-id "$COMPARTMENT_ID" \
+            --availability-domain "\"$AD\"" \
+            --shape "$SHAPE" \
+            $SHAPE_CONFIG_ARGS \
+            --subnet-id "$SUBNET_ID" \
+            --image-id "$IMAGE" \
+            --display-name "vpn-server-gha" \
+            --assign-public-ip true \
+            --metadata "'{\"ssh_authorized_keys\":\"$SSH_PUBLIC_KEY\"}'" \
+            --wait-for-state RUNNING \
+            --max-wait-seconds 240 \
+            2>&1)
+
+          EXIT_CODE=$?
+          echo "$RESULT" > /tmp/result.txt
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if echo "$RESULT" | grep -qi '"lifecycle-state": "RUNNING"'; then
+            echo "success=true" >> "$GITHUB_OUTPUT"
+            PUBLIC_IP=$(echo "$RESULT" | grep -o '"public-ip": "[^"]*"' | head -1 | cut -d'"' -f4)
+            echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+            echo "shape_used=$SHAPE" >> "$GITHUB_OUTPUT"
+          else
+            echo "success=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save success marker and push
+        if: steps.check.outputs.already_created == 'false' && steps.launch.outputs.success == 'true'
+        run: |
+          mkdir -p .oci
+          cp /tmp/result.txt .oci/SUCCESS.json
+          git config user.name "oci-retry-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add .oci/SUCCESS.json
+          git commit -m "Instance created successfully"
+          git push
+
+      - name: Notify via Telegram on success
+        if: steps.check.outputs.already_created == 'false' && steps.launch.outputs.success == 'true'
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="✅ Oracle VPN server created! Shape: ${{ steps.launch.outputs.shape_used }}, IP: ${{ steps.launch.outputs.public_ip }}"
