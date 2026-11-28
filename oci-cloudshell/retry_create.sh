@@ -46,7 +46,8 @@ while true; do
     break
   else
     SHORT=$(echo "$RESULT" | grep -oE '"code": "[^"]*"' | head -1)
-    echo "  -> неудача: $SHORT"
+    MSG=$(echo "$RESULT" | grep -oE '"message": "[^"]*"' | head -1)
+    echo "  -> неудача: $SHORT, $MSG"
   fi
 
   sleep 90
